@@ -36,7 +36,7 @@ DEFAULT_CONFIG = {
         "gradient_checkpointing":   True,
     },
     "training": {
-        "batch_size":               16,
+        "batch_size":               32,
         "gradient_accumulation_steps": 2,
         "num_epochs":               10,
         "learning_rate":            2.0e-5,

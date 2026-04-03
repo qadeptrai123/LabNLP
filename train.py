@@ -1,28 +1,38 @@
 """
 Training script for SemEval Task A — Human vs AI Code Detection.
-Imports shared components from src/. Single-GPU training, loads models from local model/ directory.
+Imports shared components from src/. Single-GPU / DDP multi-GPU training,
+loads models from local model/ directory.
 
 Usage:
     python train.py
     python train.py --epochs 5 --batch-size 32
     python train.py --resume ./checkpoints/best_model
+    # DDP (2+ GPUs):
+    torchrun --nproc_per_node=2 train.py
+    torchrun --nproc_per_node=2 train.py --epochs 5 --batch-size 32
 """
 import os, sys, random, yaml, argparse
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
+import torch.distributed as dist
+
 _num_gpus = torch.cuda.device_count()
-if _num_gpus > 1:
-    # Multi-GPU: all GPUs visible to DataParallel
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(_num_gpus))
+_is_distributed = _num_gpus > 1
+
+if _is_distributed:
+    _local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(_local_rank)
 else:
-    # Single-GPU / CPU: lock to device 0
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    _local_rank = 0
+
+_is_rank0 = (_local_rank == 0)   # True only on the primary process — use for logging / saves
 
 import numpy as np
 import pandas as pd
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -77,7 +87,8 @@ def save_checkpoint(model, tokenizer, path, epoch, metrics, config):
 def load_checkpoint(model, path, device):
     state = torch.load(os.path.join(path, "model_state.bin"), map_location=device)
     (model.module if hasattr(model, "module") else model).load_state_dict(state)
-    print(f"  -> Loaded checkpoint from {path}")
+    if _is_rank0:
+        print(f"  -> Loaded checkpoint from {path}")
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -102,6 +113,28 @@ def evaluate(model, dataloader, device):
 
             preds_all.extend(torch.argmax(logits, dim=1).cpu().numpy())
             labels_all.extend(labels.cpu().numpy())
+
+    # ── Fix #2: aggregate metrics across all DDP ranks ──────────────────────
+    if _is_distributed:
+        world_size = dist.get_world_size()
+
+        # Gather full preds/labels to every rank before computing sklearn metrics
+        preds_tensor  = torch.tensor(preds_all,  device=device)
+        labels_tensor = torch.tensor(labels_all, device=device)
+
+        preds_list  = [torch.zeros_like(preds_tensor)  for _ in range(world_size)]
+        labels_list = [torch.zeros_like(labels_tensor) for _ in range(world_size)]
+
+        dist.all_gather(preds_list,  preds_tensor)
+        dist.all_gather(labels_list, labels_tensor)
+
+        preds_all  = torch.cat(preds_list).cpu().tolist()
+        labels_all = torch.cat(labels_list).cpu().tolist()
+
+        # Average loss across ranks (reduce to rank 0 then broadcast, or all_reduce)
+        loss_tensor = torch.tensor(total_loss, device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        total_loss = loss_tensor.item() / world_size
 
     accuracy = accuracy_score(labels_all, preds_all)
     f1       = f1_score(labels_all, preds_all, average='macro')
@@ -188,48 +221,63 @@ def main():
     set_seed(seed)
 
     # Device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\nDevice: {device}  ({_num_gpus} GPU{'s' if _num_gpus > 1 else ''} available)")
-    print(f"Config: epochs={train_cfg['num_epochs']}  batch_size={train_cfg['batch_size']}  "
-          f"lr={train_cfg['learning_rate']}  supcon={train_cfg['use_supcon']}")
+    if _is_distributed:
+        device = torch.device("cuda", _local_rank)
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ── Fix #3: rank-0 only prints ─────────────────────────────────────────
+    if _is_rank0:
+        print(f"\n{'='*60}")
+        print(f"  SemEval Task A — DDP Training")
+        print(f"{'='*60}")
+        print(f"  Distributed: Yes  |  World Size: {dist.get_world_size()}"
+              if _is_distributed else "\n  Distributed: No")
+        print(f"  Device: {device}  |  Config: epochs={train_cfg['num_epochs']}  "
+              f"batch_size={train_cfg['batch_size']}  lr={train_cfg['learning_rate']}  "
+              f"supcon={train_cfg['use_supcon']}")
+        print(f"{'='*60}\n")
 
     # ── Tokenizer (UnixCoder — from local model/) ─────────────────────────────
-    base_model_path = config["model"]["base_model"]   # e.g. D:\LabNLP\model\unixcoder-base
+    base_model_path = config["model"]["base_model"]
     tokenizer  = __import__("transformers").AutoTokenizer.from_pretrained(base_model_path)
 
     # ── Data ───────────────────────────────────────────────────────────────────
     data_dir = data_cfg["data_dir"]
-    print(f"\nLoading data from: {data_dir}")
+    if _is_rank0:
+        print(f"Loading data from: {data_dir}")
     train_df = pd.read_parquet(os.path.join(data_dir, "train_processed_cleaned.parquet"))
     val_df   = pd.read_parquet(os.path.join(data_dir, "val_processed_cleaned.parquet"))
 
     train_df = train_df.dropna(subset=["label"]).reset_index(drop=True)
     val_df   = val_df.dropna(subset=["label"]).reset_index(drop=True)
-    
-    
-    print(f"  Train: {len(train_df)} | Val: {len(val_df)}")
 
-    
+    if _is_rank0:
+        print(f"  Train: {len(train_df)} | Val: {len(val_df)}\n")
 
     train_ds = AgnosticDataset(train_df, tokenizer, max_length=data_cfg["max_length"], is_train=True)
     val_ds   = AgnosticDataset(val_df,   tokenizer, max_length=data_cfg["max_length"], is_train=False)
 
     train_dl = DataLoader(
         train_ds, batch_size=train_cfg["batch_size"],
-        shuffle=True,  num_workers=2, pin_memory=True, drop_last=True,
+        shuffle=False,  num_workers=2, pin_memory=True, drop_last=True,
+        sampler=DistributedSampler(train_ds, shuffle=True) if _is_distributed else None,
     )
     val_dl = DataLoader(
         val_ds, batch_size=train_cfg["batch_size"] * 2,
         shuffle=False, num_workers=2, pin_memory=True,
+        sampler=DistributedSampler(val_ds, shuffle=False) if _is_distributed else None,
     )
 
     # ── Model ──────────────────────────────────────────────────────────────────
     model = HybridClassifier(config).to(device)
-    if _num_gpus > 1:
-        model = nn.DataParallel(model)
-        print(f"  Model loaded on {device} with DataParallel ({_num_gpus} GPUs).")
+    if _is_distributed:
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[_local_rank])
+        if _is_rank0:
+            print(f"  Model: DDP (world_size={dist.get_world_size()})")
     else:
-        print(f"  Model loaded on {device}.")
+        if _is_rank0:
+            print(f"  Model: Single-device ({device})")
 
     # ── Optimiser / Scheduler ─────────────────────────────────────────────────
     optimizer = AdamW(
@@ -248,9 +296,11 @@ def main():
         try:
             from pytorch_metric_learning import losses as pml_losses
             supcon_fn = pml_losses.SupConLoss(temperature=0.07).to(device)
-            print(f"  SupCon loss enabled (weight={supcon_w}).")
+            if _is_rank0:
+                print(f"  SupCon loss enabled (weight={supcon_w}).")
         except ImportError:
-            print("  [WARN] pytorch_metric_learning not installed — SupCon disabled.")
+            if _is_rank0:
+                print("  [WARN] pytorch_metric_learning not installed — SupCon disabled.")
 
     # ── Resume ─────────────────────────────────────────────────────────────────
     if args.resume:
@@ -264,40 +314,57 @@ def main():
     acc_steps  = train_cfg["gradient_accumulation_steps"]
     num_epochs = train_cfg["num_epochs"]
 
-    print(f"\nStarting training for {num_epochs} epochs (patience={patience})...\n")
+    if _is_rank0:
+        print(f"Starting training for {num_epochs} epochs (patience={patience})...\n")
 
     for epoch in range(num_epochs):
-        print(f"Epoch {epoch + 1}/{num_epochs}")
+        if _is_distributed:
+            train_dl.sampler.set_epoch(epoch)
+
+        if _is_rank0:
+            print(f"Epoch {epoch + 1}/{num_epochs}")
 
         train_metrics = train_one_epoch(
             model, train_dl, optimizer, scheduler, scaler, device,
             supcon_fn, supcon_w, acc_steps,
         )
-        print(f"  Train: {train_metrics}")
+        if _is_rank0:
+            print(f"  Train: {train_metrics}")
 
+        # Fix #2: gather val metrics from all ranks before comparison
         val_metrics, report, _, _ = evaluate(model, val_dl, device)
-        print(f"  Val:   {val_metrics}")
-        print(report)
+        if _is_rank0:
+            print(f"  Val:   {val_metrics}")
+            print(report)
 
         current_f1 = val_metrics["f1_macro"]
+
+        # ── Fix #1: rank-0 only checkpoint save ──────────────────────────────
         if current_f1 > best_f1:
             best_f1 = current_f1
             patience_counter = 0
-            print(f"  --> New best F1: {best_f1:.4f}")
-            save_checkpoint(
-                model, tokenizer,
-                os.path.join(checkpoint_dir, "best_model"),
-                epoch, val_metrics, config,
-            )
+            if _is_rank0:
+                print(f"  --> New best F1: {best_f1:.4f}")
+                save_checkpoint(
+                    model, tokenizer,
+                    os.path.join(checkpoint_dir, "best_model"),
+                    epoch, val_metrics, config,
+                )
         else:
             patience_counter += 1
-            print(f"  --> No improvement ({patience_counter}/{patience})")
+            if _is_rank0:
+                print(f"  --> No improvement ({patience_counter}/{patience})")
 
         if patience_counter >= patience:
-            print("\nEARLY STOPPING triggered.")
+            if _is_rank0:
+                print("\nEARLY STOPPING triggered.")
             break
 
-    print(f"\nTraining done. Best F1: {best_f1:.4f}")
+    if _is_rank0:
+        print(f"\nTraining done. Best F1: {best_f1:.4f}")
+
+    if _is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
