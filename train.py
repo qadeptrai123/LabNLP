@@ -272,7 +272,9 @@ def main():
     # ── Model ──────────────────────────────────────────────────────────────────
     model = HybridClassifier(config).to(device)
     if _is_distributed:
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[_local_rank])
+        model = nn.parallel.DistributedDataParallel(
+            model, device_ids=[_local_rank], find_unused_parameters=True,
+        )
         if _is_rank0:
             print(f"  Model: DDP (world_size={dist.get_world_size()})")
     else:
