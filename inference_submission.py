@@ -250,6 +250,7 @@ def main():
     parser.add_argument("--test_file",      default="Task_A/test.parquet")
     parser.add_argument("--checkpoint_dir", default="checkpoints/best_model")
     parser.add_argument("--batch_size",     type=int, default=64)
+    parser.add_argument("--output",         default=None)
     args = parser.parse_args()
 
     log(f"{'='*60}")
