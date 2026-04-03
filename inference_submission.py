@@ -272,6 +272,10 @@ def main():
 
     test_df = extract_features_ddp(test_df, config)
 
+    # AgnosticDataset requires 'label' column — add dummy zeros for inference
+    if "label" not in test_df.columns:
+        test_df["label"] = 0
+
     # ── Stage 2: inference ────────────────────────────────────────────────────
     all_preds, _ = run_inference(args, config, test_df)
 
