@@ -109,21 +109,26 @@ def extract_features_ddp(test_df, config):
     del extractor
     torch.cuda.empty_cache()
 
-    if _is_main:
+    # ── FIX: broadcast BEFORE slow I/O so other ranks don't idle-wait ──
+    if _is_dist:
+        if _is_main:
+            test_df_out = test_df.copy()
+            test_df_out["agnostic_features"] = full_features
+            obj_list = [test_df_out]
+        else:
+            obj_list = [None]
+        dist.broadcast_object_list(obj_list, src=0)
+        test_df_out = obj_list[0]
+
+        if _is_main:
+            log(f"Caching to {cache_path}")
+            test_df_out.to_parquet(cache_path)
+        test_df = test_df_out
+    else:
         test_df = test_df.copy()
         test_df["agnostic_features"] = full_features
         log(f"Caching to {cache_path}")
         test_df.to_parquet(cache_path)
-
-    if _is_dist:
-        dist.barrier()   # ensure cache write finishes before others read it
-        # Broadcast dataframe from rank 0 to all ranks
-        if _is_main:
-            obj_list = [test_df]
-        else:
-            obj_list = [None]
-        dist.broadcast_object_list(obj_list, src=0)
-        test_df = obj_list[0]
 
     return test_df
 
