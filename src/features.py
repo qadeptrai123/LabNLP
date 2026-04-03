@@ -94,6 +94,60 @@ class AgnosticFeatureExtractor:
         except Exception:
             return 0.0
 
+    def compute_perplexity_batch(self, codes: list[str]) -> list[float]:
+        """
+        Batched perplexity computation — much faster than single-sample.
+        Returns cross-entropy loss per sequence. Uses dynamic padding per batch
+        to avoid wasting compute on pad tokens.
+        """
+        valid = [(i, c) for i, c in enumerate(codes) if c.strip()]
+        if not valid:
+            return [0.0] * len(codes)
+
+        # Separate valid and empty codes
+        valid_codes = [c for _, c in valid]
+        valid_idx   = [i for i, _ in valid]
+
+        # Tokenize as batch (dynamic padding)
+        batch = self.tokenizer(
+            valid_codes,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_len,
+            padding=True,
+        ).to(self.device)
+
+        input_ids  = batch["input_ids"]
+        attention  = batch["attention_mask"]
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention,
+                labels=input_ids,
+            )
+
+        # Per-sequence cross-entropy (ignore pad tokens via attention mask)
+        # logits: (batch, seq_len, vocab) → shift right so label[i] = input_ids[i+1]
+        logits = outputs.logits[:, :-1, :]          # (B, L-1, V)
+        labels = input_ids[:, 1:]                   # (B, L-1)
+        mask   = attention[:, 1:].float()           # (B, L-1)
+
+        # Cross-entropy per token
+        log_probs = torch.log_softmax(logits, dim=-1)
+        nll = -log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)  # (B, L-1)
+        nll = nll * mask
+
+        # Per-sequence average (avoid pad inflation)
+        seq_losses = nll.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+
+        result = [0.0] * len(codes)
+        for local_i, global_i in enumerate(valid_idx):
+            v = seq_losses[local_i].item()
+            result[global_i] = 0.0 if (math.isnan(v) or math.isinf(v)) else v
+
+        return result
+
     def _analyze_identifiers(self, words: List[str]) -> List[float]:
         identifiers = [
             w for w in words

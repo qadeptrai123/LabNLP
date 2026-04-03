@@ -77,15 +77,32 @@ def extract_features_ddp(test_df, config):
     chunk_size = (n + _num_gpus - 1) // _num_gpus
     start = _local_rank * chunk_size
     end   = min(start + chunk_size, n)
+    chunk_codes = test_df["code"].iloc[start:end].tolist()
 
+    # ── Batch perplexity: 32 samples per batch → GPU ~80%+ utilization ─────
+    PERPLEX_BATCH = 32
+    perp_losses = []
+    for i in range(0, len(chunk_codes), PERPLEX_BATCH):
+        batch_codes = chunk_codes[i : i + PERPLEX_BATCH]
+        try:
+            perp_losses.extend(extractor.compute_perplexity_batch(batch_codes))
+        except Exception:
+            perp_losses.extend([0.0] * len(batch_codes))
+
+    # ── Remaining stylometric features (fast, single-sample is fine) ─────────
     local_features = []
     for i, code in enumerate(
-        tqdm(test_df["code"].iloc[start:end].values,
+        tqdm(chunk_codes,
              desc=f"Rank {_local_rank}", unit="samples",
              disable=(not _is_main)),
     ):
         try:
-            feats = extractor.extract_all(code)
+            words = extractor.re_words.findall(code)
+            f_ids   = extractor._analyze_identifiers(words)
+            f_const = extractor._analyze_consistency(code, words)
+            f_struc = extractor._analyze_structure(code, words)
+            # perplexity already computed in batch above
+            feats = [perp_losses[i]] + f_ids + f_const + f_struc
         except Exception:
             feats = [0.0] * 11
         local_features.append(feats)
