@@ -82,8 +82,12 @@ def extract_features_ddp(test_df, config):
     # ── Batch perplexity: 32 samples per batch → GPU ~80%+ utilization ─────
     PERPLEX_BATCH = 32
     perp_losses = []
-    for i in range(0, len(chunk_codes), PERPLEX_BATCH):
-        batch_codes = chunk_codes[i : i + PERPLEX_BATCH]
+    n_batches = (len(chunk_codes) + PERPLEX_BATCH - 1) // PERPLEX_BATCH
+    for i in tqdm(
+        range(n_batches), desc=f"Qwen perplexity [rank {_local_rank}]",
+        unit="batch", disable=(not _is_main),
+    ):
+        batch_codes = chunk_codes[i * PERPLEX_BATCH : (i + 1) * PERPLEX_BATCH]
         try:
             perp_losses.extend(extractor.compute_perplexity_batch(batch_codes))
         except Exception:
