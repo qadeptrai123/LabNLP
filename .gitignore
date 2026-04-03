@@ -1,0 +1,73 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# ── Jupyter / notebooks ──────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Data & Processed files ───────────────────────────────────────────────────
+# Raw data (large)
+# Task_A/
+# Task_A_Processed/
+
+reference/SemEval-2026-Task-13/
+
+.omc
+.claude
+model/
+
+# Checkpoints / model saves
+checkpoints/
+
+# Logs
+*.log
+logs/
+tensorboard/
+runs/
+
+# Temp / scratch
+*.tmp
+*.cache
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.dust/
+
+# Environment secrets
+.env.local
+.env.*.local
